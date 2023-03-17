@@ -1,0 +1,208 @@
+import os, copy, pydicom, cv2, glob
+import matplotlib.pyplot as plt
+import numpy as np
+import nibabel as nib
+from skimage import filters
+import pandas as pd
+from math import *
+from pathlib import Path
+from skimage import measure, morphology
+from skimage.morphology import ball, binary_closing
+from skimage.measure import label, regionprops
+from matplotlib.pyplot import figure
+from functools import reduce
+from IPython.display import clear_output
+from scipy.linalg import norm
+import scipy.ndimage
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+
+#**************************DEFINE SEGMENTATION FUNCTIONS***************************
+
+def load_scan(path):
+    slices = [pydicom.dcmread(path + '\\' + s) for s in os.listdir(path)]         
+    slices = [s for s in slices if 'SliceLocation' in s]
+    try:
+        slice_thickness = np.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2]) 
+    except:
+        slice_thickness = np.abs(slices[0].SliceLocation - slices[1].SliceLocation) 
+    for s in slices:
+        s.SliceThickness = slice_thickness
+    return slices
+    
+def get_pixels_hu(scans):
+    image = np.stack([s.pixel_array for s in scans])
+    image = image.astype(np.int16)
+    # Set outside-of-scan pixels to 0
+    # The intercept is usually -1024, so air is approximately 0
+    image[image == -2000] = 0
+    
+    # Convert to Hounsfield units (HU)
+    intercept = scans[0].RescaleIntercept
+    slope = scans[0].RescaleSlope
+    
+    if slope != 1:
+        image = slope * image.astype(np.float64)
+        image = image.astype(np.int16)
+        
+    image += np.int16(intercept)
+    return np.array(image, dtype=np.int16)
+    
+def largest_label_volume(im, bg=-1):
+    vals, counts = np.unique(im, return_counts=True)
+    counts = counts[vals != bg]
+    vals = vals[vals != bg]
+    if len(counts) > 0:
+        return vals[np.argmax(counts)]
+    else:
+        return None
+    
+def segment_lung_mask(image, fill_lung_structures=True):
+    # Binary with 1 and 2, 0 is background
+    binary_image = np.array(image >= -780, dtype = np.int8) + 1 #-780 for ffov, 0 for scouts
+    labels = measure.label(binary_image)
+ 
+    # Corner pixel is air pixel
+    binary_image[background_label == labels] = 1
+
+    if fill_lung_structures:
+        # For every slice we determine the largest solid structure
+        for i, axial_slice in enumerate(binary_image):
+            axial_slice = axial_slice - 1
+            labeling = measure.label(axial_slice)
+            l_max = largest_label_volume(labeling, bg=0)
+ 
+            if l_max is not None: #This slice contains some lung
+                binary_image[i][labeling != l_max] = 1
+            
+    binary_image -= 1
+    binary_image = 1-binary_image
+ 
+    # Remove other air pockets inside body
+    labels = measure.label(binary_image, background=0)
+    l_max = largest_label_volume(labels, bg=0)
+    if l_max is not None:
+        binary_image[labels != l_max] = 0
+ 
+    return binary_image
+    
+#**************************DEFINE PATH, INITIALIZE ALGORITHM***************************
+
+path = "C:\\Users\\GRUNT\\Desktop\\centering\\centering\\ALL_Head_Chest_Abdomen\\ALL_HEAD" #folder to images that are to be reconciled
+fullpath = [(path + '/' + s) for s in os.listdir(path)]
+
+patient_dicom = load_scan(path)
+patient_pixels = get_pixels_hu(patient_dicom)
+
+# get masks 
+segmented_lungs = segment_lung_mask(patient_pixels, fill_lung_structures = False)
+segmented_lungs_fill = segment_lung_mask(patient_pixels, fill_lung_structures = True)
+#internal_structures = segmented_lungs_fill - segmented_lungs
+
+# isolate lung from chest
+copied_pixels = copy.deepcopy(patient_pixels)
+for i, mask in enumerate(segmented_lungs_fill): 
+    get_high_vals = mask == 0
+    copied_pixels[i][get_high_vals] = 0
+seg_lung_pixels = copied_pixels
+
+#**************************DEFINE TEST IMAGE***************************
+
+filenum = 36 #range is 0-n, 0 being first image in series. 
+
+print("filename is:", os.listdir(path)[filenum])
+data_collection_diameter = patient_dicom[0].DataCollectionDiameter
+image_center = np.array([data_collection_diameter / 2, data_collection_diameter / 2])
+print("center of images in series is:", image_center)
+
+#**************************CHECK SEGMENTATION, CENTER, DISPLACEMENT FOR TEST IMAGE***************************
+
+# sanity check
+f, ax = plt.subplots(1,2, figsize=(8,6), dpi = 200)
+ax[0].imshow(patient_pixels[filenum], cmap=plt.cm.bone)
+ax[0].axis(True)
+ax[0].set_xlabel("mm", size = 8)
+ax[0].set_ylabel("mm", size = 8)
+ax[0].set_title('Original Slice', size = 10)
+ax[1].imshow(seg_lung_pixels[filenum], cmap=plt.cm.bone)
+ax[1].axis(True)
+ax[1].set_title('Segmented Slice')
+ax[1].set_xlabel("mm", size = 8)
+ax[1].set_ylabel("mm", size = 8)
+plt.show()
+#plt.imshow(seg_lung_pixels[7], cmap=plt.cm.bone)
+
+# Assume binary_mask is a 2D numpy array with dtype bool
+centroid = np.mean(np.argwhere(seg_lung_pixels[filenum]==0), axis=0)
+centroid_x, centroid_y = int(centroid[1]), int(centroid[0])
+
+patient_center = np.array([centroid_x, centroid_y])
+displacement = patient_center - image_center
+
+# print(centroid_x)
+# print(centroid_y)
+print("patient center is:", patient_center)
+print("displacement from image center is:", displacement)
+
+#**************************PRINT SLICE WITH CENTER + FOV MARKED***************************
+
+figure(figsize=(5, 5), dpi=200)
+plt.title("Slice With Centers Marked", size = 10) #title
+plt.xlabel("mm", size = 8) #x label
+plt.ylabel("mm", size = 8) #y label
+
+plt.imshow(patient_pixels[filenum], cmap=plt.cm.bone)
+plt.scatter(centroid_x, centroid_y, marker="x", color="red", s=20)
+plt.scatter(data_collection_diameter / 2, data_collection_diameter / 2, marker="o", color="blue", s=20)
+A = "Region Center"
+B = "FOV Center"
+plt.legend([A, B], prop={'size': 6})
+plt.show()
+
+#**************************INPUT: ONE FOLDER OF DICOM IMAGES. EXPORT: CSV WITH CENTERING RESULTS***************************
+
+os.chdir(path)
+
+#image_center = np.array([250, 250])
+
+df = pd.DataFrame(columns=["image_num_in_series", "whole_filename", "filename", "x_center_coordinate", "y_center_coordinate", "image_center", "region_center", "displacement", "center_calculated_by_hand"])
+
+num_of_files = len([name for name in os.listdir('.') if os.path.isfile(name)])
+
+totalcounter = 0
+counter = 0
+for i in range(num_of_files): 
+    imagenum = counter + 1
+    filename = os.path.basename(os.path.abspath(fullpath[counter]))
+    wholefilename = os.path.abspath(fullpath[counter])#[14:]
+
+    centroid = np.mean(np.argwhere(seg_lung_pixels[counter]==0), axis=0)
+    centroid_x, centroid_y = int(centroid[1]), int(centroid[0])
+
+    patient_center = np.array([centroid_x, centroid_y])
+    displacement = patient_center - image_center
+
+    df = df.append({'image_num_in_series':imagenum, 'whole_filename':wholefilename, 'filename':filename, 'x_center_coordinate':centroid_x, 
+    'y_center_coordinate':centroid_y, "image_center":image_center, "region_center":patient_center, 'displacement':displacement}, ignore_index=True)
+
+    counter += 1
+    totalcounter += 1
+    clear_output(wait = True)
+    print("current file:", wholefilename)
+    print("number of files analyzed:", totalcounter)
+        
+os.chdir("C:\\Users\\GRUNT\\Desktop") 
+df.to_csv("dumptest.csv", index = False) #DO NOT CHANGE TO NAME OF EXISTING FILE IN DESKTOP, WILL REPLACE
+print("dataset has been exported to desktop.")
+print("done.")
+
+#end
+
+
+
+
+
+
+
+#Image segmentation code adapted from GUIDO ZUIDHOF 2017 under Apache 2.0 license
+#Acknowledgments: Massachusetts General Hospital, Partners Healthcare and all affiliated sites; Drs. Mannudeep Kalra, Emiliano Garza Frias, Giridhar Dasegowda, Lena Karout, Parisa Kaviani, and Roshan Fahimi; my family.
