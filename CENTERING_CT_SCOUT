@@ -1,0 +1,337 @@
+#For github
+
+import os, copy, pydicom, cv2, glob
+import matplotlib.pyplot as plt
+import numpy as np
+import nibabel as nib
+from skimage import filters
+import pandas as pd
+import warnings
+from math import *
+from pathlib import Path
+from skimage import measure, morphology
+from skimage.morphology import ball, binary_closing
+from skimage.measure import label, regionprops
+from matplotlib.pyplot import figure
+from functools import reduce
+from IPython.display import clear_output
+from scipy.linalg import norm
+import scipy.ndimage
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+#**************************DEFINE SEGMENTATION FUNCTIONS***************************
+
+def load_scan(path):
+    slices = [pydicom.dcmread(path + '\\' + s) for s in os.listdir(path)]     #    slices = [pydicom.dcmread(path + '/' + s) for s in os.listdir(path)]    
+    slices = [s for s in slices if 'SliceLocation' in s]
+    slices.sort(key = lambda x: int(x.InstanceNumber))
+    try:
+        slice_thickness = np.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2]) #UNCOMMENT THIS AND BELOW FOR FFOV IMAGES, COMMENT AND SET TO 0 FOR SCOUTS
+    except:
+        slice_thickness = np.abs(slices[0].SliceLocation - slices[1].SliceLocation) #SEE ABOVE COMMENT
+    for s in slices:
+        s.SliceThickness = slice_thickness
+    return slices
+
+def get_pixels_hu(scans):
+    image = np.stack([s.pixel_array for s in scans])
+    #image = (np.maximum(image,0)/image.max())*400 #this one is new
+    image = image.astype(np.int16)
+    # Set outside-of-scan pixels to 0
+    image[image == -2000] = 0
+    
+    # Convert to Hounsfield units (HU)
+    intercept = scans[0].RescaleIntercept
+    slope = scans[0].RescaleSlope
+    
+    if slope != 1:
+        image = slope * image.astype(np.float64)
+        image = image.astype(np.int16)
+        
+    image += np.int16(intercept)
+    
+    return np.array(image, dtype=np.int16)
+
+def largest_label_volume(im, bg=-1):
+    vals, counts = np.unique(im, return_counts=True)
+    counts = counts[vals != bg]
+    vals = vals[vals != bg]
+    if len(counts) > 0:
+        return vals[np.argmax(counts)]
+    else:
+        return None
+    
+def segment_lung_mask(image, fill_lung_structures=True):
+    # Binary with 1 and 2, 0 is background
+    binary_image = np.array(image >= 100, dtype = np.int8) + 1 #-780 for ffov, 0 for scouts
+    labels = measure.label(binary_image)
+ 
+    # Fill the air around the person
+    background_label = labels[0,0,0]
+
+    # Corner pixel is air pixel
+    binary_image[background_label == labels] = 1
+
+    if fill_lung_structures:
+        # For every slice we determine the largest solid structure
+        for i, axial_slice in enumerate(binary_image):
+            axial_slice = axial_slice - 1
+            labeling = measure.label(axial_slice)
+            l_max = largest_label_volume(labeling, bg=0)
+ 
+            if l_max is not None: #This slice contains some lung
+                binary_image[i][labeling != l_max] = 1
+            
+    binary_image -= 1
+    binary_image = 1-binary_image
+ 
+    # Remove other air pockets inside body
+    labels = measure.label(binary_image, background=0)
+    l_max = largest_label_volume(labels, bg=0)
+    if l_max is not None:
+        binary_image[labels != l_max] = 0
+ 
+    return binary_image
+
+#**************************DEFINE PATH, INITIALIZE ALGORITHM***************************
+
+path = "C:\\Users\\GRUNT\\Desktop\\centering\\centering\\SCOUT\\combineddfcibwhscouts" #folder to images that are to be reconciled
+fullpath = [(path + '/' + s) for s in os.listdir(path)]
+
+lowest_dirs = list()
+file_count = []
+
+for root,dirs,files in os.walk(path):
+    if not dirs:
+        lowest_dirs.append(root)
+        
+for subdir in lowest_dirs:
+    file_count.append(sum(len(files) for _, _, files in os.walk(subdir)))
+    np.array(file_count)
+    length = np.sum(file_count)
+    
+totalcounter = 0
+
+df = pd.DataFrame(columns=["image_num_in_series", "whole_filename", "filename", "image_center", "x_image_center", "y_image_center", "AP_center", "x_center_coordinate_AP", "y_center_coordinate_AP", 
+                            "lat_center", "x_center_coordinate_lat", "y_center_coordinate_lat", "displacement", "center_calculated_by_hand", "TOTAL_horiz_disp_AP,vert_disp_lat"])
+#print(lowest_dirs)
+
+
+#********************************MAIN: INPUT: FOLDER WITH FOLDERS WITH IMAGES OUTPUT: CSV*********************************
+
+for subdir in lowest_dirs:
+    patient_dicom = load_scan(subdir)
+    patient_pixels = get_pixels_hu(patient_dicom)
+    
+    # get masks 
+    segmented_lungs = segment_lung_mask(patient_pixels,    
+                        fill_lung_structures = False)
+    segmented_lungs_fill = segment_lung_mask(patient_pixels,     
+                        fill_lung_structures = True)
+    #internal_structures = segmented_lungs_fill - segmented_lungs
+
+    # isolate lung from chest
+    copied_pixels = copy.deepcopy(patient_pixels)
+    for i, mask in enumerate(segmented_lungs_fill): 
+        get_high_vals = mask == 0
+        copied_pixels[i][get_high_vals] = 0
+    seg_lung_pixels = copied_pixels
+    
+    for i in range(2): 
+        aplatposition = patient_dicom[i].ImagePositionPatient
+        counter = 0
+        if aplatposition[1] == 0:    #AP orientation check
+            imagenum = counter + 1
+            filename = os.path.basename(os.path.abspath(fullpath[i]))
+            wholefilename = os.path.abspath(fullpath[i])#[14:]
+            cols = patient_dicom[i].Columns
+            rows = patient_dicom[i].Rows
+
+            image_center = np.array([int(cols / 2), int(rows / 2)])
+
+            centroid = np.argwhere(seg_lung_pixels[i] == 0)
+
+            centroidfilter = np.where((centroid[:,0]==image_center[1]))
+            filteredcentroid = centroid[centroidfilter]
+            xcalculated = int(np.mean(filteredcentroid[:,1]))
+            patient_center = np.array([xcalculated, image_center[1]])
+
+            #print(patient_center)
+
+            displacement = patient_center - image_center
+            xdisplacement = displacement[0]
+            df = df.append({'image_num_in_series':i, 'whole_filename':subdir, 'filename':filename, "image_center":image_center, "x_image_center":image_center[0], "y_image_center":image_center[1], 
+                            "AP_center":patient_center, "x_center_coordinate_AP":xcalculated, "y_center_coordinate_AP":image_center[1], "displacement":displacement}, ignore_index=True)
+
+        elif aplatposition[0] == 0:    #lat orientation check   
+            imagenum = counter + 1
+            filename = os.path.basename(os.path.abspath(fullpath[i]))
+            wholefilename = os.path.abspath(fullpath[counter])#[14:]
+            cols = patient_dicom[i].Columns
+            rows = patient_dicom[i].Rows
+
+            image_center = np.array([int(cols / 2), int(rows / 2)])
+
+            centroid = np.argwhere(seg_lung_pixels[i] == 0)
+
+            centroidfilter = np.where((centroid[:,0]==image_center[1]))
+            filteredcentroid = centroid[centroidfilter]
+            ycalculated = int(np.mean(filteredcentroid[:,1]))
+            patient_center = np.array([ycalculated, image_center[1]])
+
+            displacement = patient_center - image_center
+            ydisplacement = displacement[0]
+
+            df = df.append({'image_num_in_series':i, 'whole_filename':subdir, 'filename':filename, "image_center":image_center, "x_image_center":image_center[0], "y_image_center":image_center[1], 
+                            "lat_center":patient_center, "x_center_coordinate_lat":ycalculated, "y_center_coordinate_lat":image_center[1], "displacement":displacement}, ignore_index=True)
+
+        counter += 1
+        totalcounter += 1
+        clear_output(wait = True)
+        print("current file:", subdir)
+        print("number of files analyzed:", totalcounter)
+        #suppress warnings
+        warnings.filterwarnings("ignore")
+
+    totaldisplacement = np.array([xdisplacement, ydisplacement])  
+    df = df.append({"TOTAL_horiz_disp_AP,vert_disp_lat":totaldisplacement}, ignore_index = True)
+
+os.chdir("C:\\Users\\GRUNT\\Desktop") 
+df.to_csv("test.csv", index = False)
+print("dataset has been exported to desktop.")
+print("done.")
+    
+#**************************DEFINE TEST IMAGE***************************
+filenum = 9
+APorLAT = 0 #0 for AP, 1 for LAT (for most of the images)
+
+newpath = os.path.join(path, str(filenum), "IMAGES")
+print("filename is:", os.listdir(newpath)[APorLAT])
+
+patient_dicom = load_scan(newpath)
+patient_pixels = get_pixels_hu(patient_dicom)
+
+#**************************CHECK SEGMENTATION, CENTER, DISPLACEMENT FOR TEST IMAGE***************************
+
+# get masks 
+segmented_lungs = segment_lung_mask(patient_pixels,    
+                    fill_lung_structures = False)
+segmented_lungs_fill = segment_lung_mask(patient_pixels,     
+                    fill_lung_structures = True)
+
+# isolate lung from chest
+copied_pixels = copy.deepcopy(patient_pixels)
+for i, mask in enumerate(segmented_lungs_fill): 
+    get_high_vals = mask == 0
+    copied_pixels[i][get_high_vals] = 0
+seg_lung_pixels = copied_pixels
+
+cols = patient_dicom[APorLAT].Columns
+rows = patient_dicom[APorLAT].Rows
+image_center = np.array([int(cols / 2), int(rows / 2)])
+
+print("image center is:", image_center)
+
+centroid = np.argwhere(seg_lung_pixels[APorLAT] == 0)
+centroidfilter = np.where((centroid[:,0]==image_center[1]))
+filteredcentroid = centroid[centroidfilter]
+xcalculated = int(np.mean(filteredcentroid[:,1]))
+
+patient_center = np.array([xcalculated, image_center[1]])
+print("patient center is:", patient_center)
+
+#**************************PRINT SLICE WITH CENTER + FOV MARKED***************************
+
+figure(figsize=(5, 5), dpi=250)
+plt.title("Slice With Centers Marked", size = 10) #title
+plt.xlabel("mm", size = 8) #x label
+plt.ylabel("mm", size = 8) #y label
+
+plt.imshow(patient_pixels[APorLAT], cmap=plt.cm.bone)
+plt.scatter(patient_center[0], patient_center[1], marker="x", color="red", s=10)
+# make marker thinner to make it easier to see
+
+plt.scatter(image_center[0], image_center[1], marker="o", color="blue", s=10)
+A = "Region Center"
+B = "FOV Center"
+plt.legend([A, B], prop={'size': 6}, loc='upper right', bbox_to_anchor=(1.7, 1))
+
+#plt.savefig('scouttest.png', format='png', dpi = 1200, transparent=True) #if using dots, not pixels, for marker type, dpi does not change size in saved file, adjust markersize for visibility, keep dpi high. 
+plt.show()
+
+#**************************PRINT ALL IMAGES: ORIGINAL + SEGMENTED, WITH CENTERS***************************
+
+for filenum in [x for x in range(39,41)]: #first 1:80, then 80:200
+    for APorLAT in [0,1]:
+
+        newpath = os.path.join(path, str(filenum), "IMAGES")
+
+        print("path to file is:", newpath[48:-6])
+
+        patient_dicom = load_scan(newpath)
+        patient_pixels = get_pixels_hu(patient_dicom)
+
+        # get masks 
+        segmented_lungs = segment_lung_mask(patient_pixels,    
+                            fill_lung_structures = False)
+        segmented_lungs_fill = segment_lung_mask(patient_pixels,     
+                            fill_lung_structures = True)
+        #internal_structures = segmented_lungs_fill - segmented_lungs
+
+        # isolate lung from chest
+        copied_pixels = copy.deepcopy(patient_pixels)
+        for i, mask in enumerate(segmented_lungs_fill): 
+            get_high_vals = mask == 0
+            copied_pixels[i][get_high_vals] = 0
+        seg_lung_pixels = copied_pixels
+
+        cols = patient_dicom[APorLAT].Columns
+        rows = patient_dicom[APorLAT].Rows
+        image_center = np.array([int(cols / 2), int(rows / 2)])
+
+        print("image center is:", image_center)
+
+
+        centroid = np.argwhere(seg_lung_pixels[APorLAT] == 0)
+        centroidfilter = np.where((centroid[:,0]==image_center[1]))
+        filteredcentroid = centroid[centroidfilter]
+        xcalculated = int(np.mean(filteredcentroid[:,1]))
+
+        patient_center = np.array([xcalculated, image_center[1]])
+        print("patient center is:", patient_center)
+        
+        A = "Region Center"
+        B = "FOV Center"
+
+        f, ax = plt.subplots(1,2, figsize=(6,4), dpi = 200)
+        ax[0].imshow(patient_pixels[APorLAT], cmap=plt.cm.bone)
+        ax[0].scatter(patient_center[0], patient_center[1], marker="x", color="red", s=10)
+        ax[0].scatter(image_center[0], image_center[1], marker="o", color="cornflowerblue", s=10)
+        ax[0].axis(True)
+        ax[0].set_xlabel("mm", size = 8)
+        ax[0].set_ylabel("mm", size = 8)
+        ax[0].legend([A, B], prop={'size': 6}, loc='upper right', bbox_to_anchor=(1.95, 1))
+        ax[0].set_title('Original Slice', size = 10)
+
+        ax[1].imshow(seg_lung_pixels[APorLAT], cmap=plt.cm.bone)
+        ax[1].scatter(patient_center[0], patient_center[1], marker="x", color="red", s=10)
+        ax[1].scatter(image_center[0], image_center[1], marker="o", color="slateblue", s=10)
+        ax[1].axis(True)
+        ax[1].set_title('Segmented Slice')
+        ax[1].set_xlabel("mm", size = 8)
+        ax[1].set_ylabel("mm", size = 8)
+        ax[1].legend([A, B], prop={'size': 6}, loc='upper right', bbox_to_anchor=(1.95, 1))
+        #display the plot
+
+        warnings.filterwarnings("ignore")
+
+        plt.show()
+
+#end
+
+
+
+
+
+#Image segmentation code adapted from GUIDO ZUIDHOF 2017 under Apache 2.0 license
+#Acknowledgments: Massachusetts General Hospital, Partners Healthcare and all affiliated sites; Drs. Mannudeep Kalra, Emiliano Garza Frias, Giridhar Dasegowda, Lena Karout, Parisa Kaviani, and Roshan Fahimi; my family.
