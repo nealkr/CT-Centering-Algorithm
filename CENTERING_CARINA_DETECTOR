@@ -1,0 +1,120 @@
+#GENERALIZED CARINA DETECTION MODEL
+
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+
+# Replace these with the paths to your folders containing carina and non-carina images
+carina_folder = 'path/to/carina/folder'
+non_carina_folder = 'path/to/non-carina/folder'
+
+# training parameters
+img_size = 224
+batch_size = 32
+epochs = 20
+
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=20,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest',
+    validation_split=0.2
+)
+
+train_generator = train_datagen.flow_from_directory(
+    os.path.dirname(carina_folder),
+    target_size=(img_size, img_size),
+    batch_size=batch_size,
+    class_mode='binary',
+    subset='training'
+)
+
+validation_generator = train_datagen.flow_from_directory(
+    os.path.dirname(carina_folder),
+    target_size=(img_size, img_size),
+    batch_size=batch_size,
+    class_mode='binary',
+    subset='validation'
+)
+
+# CNN model
+model = Sequential([
+    Conv2D(32, (3, 3), activation='relu', input_shape=(img_size, img_size, 3)),
+    MaxPooling2D(pool_size=(2, 2)),
+    Conv2D(64, (3, 3), activation='relu'),
+    MaxPooling2D(pool_size=(2, 2)),
+    Conv2D(128, (3, 3), activation='relu'),
+    MaxPooling2D(pool_size=(2, 2)),
+    Conv2D(128, (3, 3), activation='relu'),
+    MaxPooling2D(pool_size=(2, 2)),
+    Flatten(),
+    Dropout(0.5),
+    Dense(512, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+
+# compile
+model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+# train
+history = model.fit(
+    train_generator,
+    steps_per_epoch=train_generator.samples // batch_size,
+    epochs=epochs,
+    validation_data=validation_generator,
+    validation_steps=validation_generator.samples // batch_size
+)
+
+# save model
+model.save('carina_detection_model.h5')
+print('Model saved as carina_detection_model.h5')
+
+#ISOLATE SLICES CONTAINING CARINA (DETECTED BY CARINA DETECTION MODEL)
+
+import os
+import pydicom
+import numpy as np
+import tensorflow as tf
+
+# Replace this with the path to your folder containing the DICOM files
+input_folder = 'path/to/input/folder'
+output_folder = 'path/to/output/folder'
+
+# Replace this with the path to your pre-trained model
+model_path = 'path/to/your/model'
+
+model = tf.keras.models.load_model(model_path)
+
+file_list = [f for f in os.listdir(input_folder) if f.endswith('.dcm')]
+file_list.sort()
+max_prob = 0
+selected_slice = None
+
+for file in file_list:
+    file_path = os.path.join(input_folder, file)
+    dicom_slice = pydicom.dcmread(file_path)
+    img_array = dicom_slice.pixel_array
+
+    preprocessed_img = tf.image.resize(img_array, (224, 224))
+    preprocessed_img = preprocessed_img / 255.0
+    preprocessed_img = np.expand_dims(preprocessed_img, axis=0)
+
+    carina_prob = model.predict(preprocessed_img)[0][1]
+
+    if carina_prob > max_prob:
+        max_prob = carina_prob
+        selected_slice = dicom_slice
+
+if selected_slice is not None:
+    output_file = os.path.join(output_folder, 'carina_slice.dcm')
+    selected_slice.save_as(output_file)
+    print(f'Saved the carina slice as {output_file}')
+else:
+    print('Carina slice not found')
