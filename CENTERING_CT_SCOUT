@@ -1,5 +1,3 @@
-#For github
-
 import os, copy, pydicom, cv2, glob
 import matplotlib.pyplot as plt
 import numpy as np
