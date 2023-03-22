@@ -16,7 +16,6 @@ from scipy.linalg import norm
 import scipy.ndimage
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-
 #**************************DEFINE SEGMENTATION FUNCTIONS***************************
 
 def load_scan(path):
